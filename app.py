@@ -46,7 +46,7 @@ def get_leagues():
             continue
         current = next((s for s in item.get("seasons", []) if s.get("current")), None)
         if current:
-            found[name] = {"id": item["league"]["id"], "season": current["year"]}
+            found[name] = {"id": item["league"]["id"], "season": 2024}
     return found, data.get("errors", [])
 
 @st.cache_data(ttl=21600, show_spinner=False)
