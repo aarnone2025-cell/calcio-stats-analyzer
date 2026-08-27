@@ -1,15 +1,10 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-from pathlib import Path
+import requests
 
 st.set_page_config(page_title="Calcio Stats Analyzer", page_icon="⚽", layout="wide")
-
-REQUIRED = [
-    "date","league","match","team","opponent","player","position","minutes",
-    "shots_total","shots_on_target","yellow_cards","red_cards","saves"
-]
+BASE_URL = "https://v3.football.api-sports.io"
 
 MARKETS = {
     "1+ tiro": ("shots_total", 1),
@@ -23,143 +18,239 @@ MARKETS = {
     "5+ parate": ("saves", 5),
 }
 
-def load_data(uploaded=None):
-    if uploaded is not None:
-        df = pd.read_csv(uploaded)
-    else:
-        p = Path(__file__).parent / "sample_matches.csv"
-        df = pd.read_csv(p)
+def get_key():
+    try:
+        return st.secrets["API_FOOTBALL_KEY"]
+    except Exception:
+        return None
 
-    missing = [c for c in REQUIRED if c not in df.columns]
-    if missing:
-        st.error("Colonne mancanti: " + ", ".join(missing))
-        st.stop()
+@st.cache_data(ttl=21600, show_spinner=False)
+def api_get(endpoint, params):
+    key = get_key()
+    r = requests.get(
+        f"{BASE_URL}/{endpoint}",
+        headers={"x-apisports-key": key},
+        params=params,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
 
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    numeric = ["minutes","shots_total","shots_on_target","yellow_cards","red_cards","saves"]
-    for c in numeric:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-    return df.dropna(subset=["date"]).sort_values("date")
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_leagues():
+    data = api_get("leagues", {"country": "Italy", "current": "true"})
+    found = {}
+    for item in data.get("response", []):
+        name = item.get("league", {}).get("name", "")
+        if name not in ("Serie A", "Serie B"):
+            continue
+        current = next((s for s in item.get("seasons", []) if s.get("current")), None)
+        if current:
+            found[name] = {"id": item["league"]["id"], "season": current["year"]}
+    return found, data.get("errors", [])
 
-def rate_for(g, stat, threshold, n=None, min_minutes=1):
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_fixtures(league_id, season, last_n):
+    data = api_get("fixtures", {
+        "league": league_id,
+        "season": season,
+        "last": last_n,
+        "status": "FT",
+        "timezone": "Europe/Rome",
+    })
+    return data.get("response", []), data.get("errors", [])
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_next(league_id, season):
+    data = api_get("fixtures", {
+        "league": league_id,
+        "season": season,
+        "next": 10,
+        "timezone": "Europe/Rome",
+    })
+    return data.get("response", [])
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_players(fixture_id):
+    data = api_get("fixtures/players", {"fixture": fixture_id})
+    return data.get("response", []), data.get("errors", [])
+
+def parse_rows(fixtures):
+    rows = []
+    bar = st.progress(0, text="Caricamento statistiche giocatori...")
+    total = max(len(fixtures), 1)
+
+    for i, f in enumerate(fixtures):
+        fid = f["fixture"]["id"]
+        date = pd.to_datetime(f["fixture"]["date"]).date().isoformat()
+        home = f["teams"]["home"]["name"]
+        away = f["teams"]["away"]["name"]
+        match = f"{home} - {away}"
+
+        blocks, _ = get_players(fid)
+        for block in blocks:
+            team = block.get("team", {}).get("name", "")
+            opponent = away if team == home else home
+            for p in block.get("players", []):
+                stats = p.get("statistics", [])
+                if not stats:
+                    continue
+                s = stats[0]
+                games = s.get("games") or {}
+                shots = s.get("shots") or {}
+                cards = s.get("cards") or {}
+                goals = s.get("goals") or {}
+                rows.append({
+                    "date": date,
+                    "league": f["league"]["name"],
+                    "match": match,
+                    "team": team,
+                    "opponent": opponent,
+                    "player": p.get("player", {}).get("name", ""),
+                    "position": games.get("position", ""),
+                    "minutes": games.get("minutes") or 0,
+                    "shots_total": shots.get("total") or 0,
+                    "shots_on_target": shots.get("on") or 0,
+                    "yellow_cards": cards.get("yellow") or 0,
+                    "red_cards": cards.get("red") or 0,
+                    "saves": goals.get("saves") or 0,
+                })
+        bar.progress((i + 1) / total, text=f"Partite analizzate: {i+1}/{len(fixtures)}")
+    bar.empty()
+    return pd.DataFrame(rows)
+
+def rate(g, stat, threshold, n, min_minutes):
     x = g[g["minutes"] >= min_minutes].sort_values("date")
     if n:
         x = x.tail(n)
     if len(x) == 0:
-        return np.nan, 0
-    return (x[stat] >= threshold).mean(), len(x)
+        return np.nan
+    return (x[stat] >= threshold).mean()
 
-def build_rankings(df, market, min_minutes, min_apps, odds=None):
+def rankings(df, market, min_minutes, min_apps):
     stat, threshold = MARKETS[market]
     rows = []
-    league_avg = (df[stat] >= threshold).mean() if len(df) else 0
+    if df.empty:
+        return pd.DataFrame()
+    league_avg = (df[stat] >= threshold).mean()
 
-    for player, g in df.groupby("player", sort=False):
-        g = g.sort_values("date")
-        usable = g[g["minutes"] >= min_minutes]
+    for player, g in df.groupby("player"):
+        usable = g[g["minutes"] >= min_minutes].sort_values("date")
         if len(usable) < min_apps:
             continue
-
-        r5, n5 = rate_for(g, stat, threshold, 5, min_minutes)
-        r10, n10 = rate_for(g, stat, threshold, 10, min_minutes)
-        rs, ns = rate_for(g, stat, threshold, None, min_minutes)
-
+        r5 = rate(g, stat, threshold, 5, min_minutes)
+        r10 = rate(g, stat, threshold, 10, min_minutes)
+        rp = rate(g, stat, threshold, None, min_minutes)
         vals, weights = [], []
-        for val, w in [(r5, 0.45), (r10, 0.30), (rs, 0.25)]:
-            if not np.isnan(val):
-                vals.append(val)
-                weights.append(w)
-        raw = np.average(vals, weights=weights) if vals else np.nan
-
-        sample_strength = min(ns / 15.0, 1.0)
-        prob = raw * sample_strength + league_avg * (1 - sample_strength)
-
+        for v, w in [(r5, .45), (r10, .30), (rp, .25)]:
+            if not np.isnan(v):
+                vals.append(v); weights.append(w)
+        raw = np.average(vals, weights=weights)
+        strength = min(len(usable) / 15.0, 1.0)
+        prob = raw * strength + league_avg * (1 - strength)
         last = usable.iloc[-1]
-        avg_minutes = usable.tail(10)["minutes"].mean()
-
-        row = {
+        rows.append({
             "Giocatore": player,
             "Squadra": last["team"],
             "Ruolo": last["position"],
-            "Campionato": last["league"],
-            "Presenze usate": int(ns),
-            "Minuti medi": round(avg_minutes, 1),
-            "Ultime 5": round(r5 * 100, 1) if not np.isnan(r5) else np.nan,
-            "Ultime 10": round(r10 * 100, 1) if not np.isnan(r10) else np.nan,
-            "Stagione": round(rs * 100, 1) if not np.isnan(rs) else np.nan,
+            "Presenze usate": len(usable),
+            "Minuti medi": round(usable.tail(10)["minutes"].mean(), 1),
+            "Ultime 5": round(r5 * 100, 1),
+            "Ultime 10": round(r10 * 100, 1),
+            "Periodo": round(rp * 100, 1),
             "Prob. stimata": round(prob * 100, 1),
             "Quota equa": round(1 / prob, 2) if prob > 0 else np.nan,
-        }
-        if odds is not None and odds > 1:
-            implied = 1 / odds
-            row["Quota inserita"] = odds
-            row["Prob. quota"] = round(implied * 100, 1)
-            row["Edge"] = round((prob - implied) * 100, 1)
-        rows.append(row)
-
+        })
     out = pd.DataFrame(rows)
-    if len(out):
-        out = out.sort_values(["Prob. stimata","Presenze usate"], ascending=[False,False])
+    if not out.empty:
+        out = out.sort_values(["Prob. stimata", "Presenze usate"], ascending=[False, False])
     return out
 
 st.title("⚽ Calcio Stats Analyzer")
-st.caption("MVP per Serie A / Serie B — tiri, tiri in porta, cartellini e parate.")
+st.caption("Dati reali API-Football — Serie A e Serie B")
+
+if not get_key():
+    st.error("Chiave API non trovata nei Secrets di Streamlit.")
+    st.stop()
+
+with st.spinner("Connessione ad API-Football..."):
+    leagues, errors = get_leagues()
+
+if errors:
+    st.error(f"Errore API: {errors}")
+    st.stop()
+
+if not leagues:
+    st.error("Non trovo Serie A o Serie B tra le competizioni italiane correnti.")
+    st.stop()
 
 with st.sidebar:
-    st.header("Dati")
-    uploaded = st.file_uploader("Carica CSV statistiche partita/giocatore", type=["csv"])
-    st.caption("Se non carichi nulla viene usato il file dimostrativo incluso.")
-
-df = load_data(uploaded)
-
-with st.sidebar:
-    leagues = sorted(df["league"].dropna().unique().tolist())
-    selected_leagues = st.multiselect("Campionato", leagues, default=leagues)
+    st.header("Filtri")
+    league_name = st.selectbox("Campionato", [x for x in ["Serie A", "Serie B"] if x in leagues])
+    last_n = st.slider("Partite recenti da analizzare", 5, 20, 10, 5)
     market = st.selectbox("Mercato", list(MARKETS.keys()))
-    min_minutes = st.slider("Minuti minimi per contare una presenza", 1, 90, 45)
-    min_apps = st.slider("Presenze minime", 2, 20, 5)
-    threshold_prob = st.slider("Mostra probabilità da", 50, 100, 75)
-    use_odds = st.checkbox("Confronta con una quota")
-    odds = st.number_input("Quota bookmaker", min_value=1.01, max_value=20.0, value=1.50, step=0.01) if use_odds else None
+    min_minutes = st.slider("Minuti minimi", 1, 90, 45)
+    min_apps = st.slider("Presenze minime", 2, 10, 3)
+    threshold = st.slider("Mostra probabilità da", 50, 100, 70)
+    st.caption("Cache di 6 ore per ridurre il consumo della quota API.")
 
-fdf = df[df["league"].isin(selected_leagues)] if selected_leagues else df.iloc[0:0]
-ranking = build_rankings(fdf, market, min_minutes, min_apps, odds)
-filtered = ranking[ranking["Prob. stimata"] >= threshold_prob].copy() if len(ranking) else ranking
+cfg = leagues[league_name]
+st.info(f"📡 {league_name} — stagione {cfg['season']}")
+
+with st.spinner("Scarico le partite concluse..."):
+    fixtures, errors = get_fixtures(cfg["id"], cfg["season"], last_n)
+
+if errors:
+    st.error(f"Errore partite: {errors}")
+    st.stop()
+
+if not fixtures:
+    st.warning("Nessuna partita conclusa trovata.")
+    st.stop()
+
+df = parse_rows(fixtures)
+if df.empty:
+    st.warning("Le partite sono state trovate, ma l'API non ha restituito statistiche giocatore per queste gare.")
+    st.stop()
+
+ranking = rankings(df, market, min_minutes, min_apps)
+filtered = ranking[ranking["Prob. stimata"] >= threshold].copy() if not ranking.empty else ranking
 
 c1, c2, c3 = st.columns(3)
-c1.metric("Giocatori analizzati", len(ranking))
-c2.metric(f"Segnali ≥ {threshold_prob}%", len(filtered))
-if len(filtered):
-    c3.metric("Probabilità massima", f'{filtered["Prob. stimata"].max():.1f}%')
-else:
-    c3.metric("Probabilità massima", "—")
+c1.metric("Giocatori analizzati", df["player"].nunique())
+c2.metric(f"Segnali ≥ {threshold}%", len(filtered))
+c3.metric("Partite analizzate", len(fixtures))
 
-st.subheader(f"TOP — {market}")
-if len(filtered):
-    def label(p):
+st.subheader(f"🏆 TOP — {market}")
+if not filtered.empty:
+    def cls(p):
         if p >= 85: return "🟢 Molto alta"
         if p >= 75: return "🟡 Alta"
         if p >= 65: return "⚪ Media"
         return "🔴 Bassa"
-    filtered.insert(0, "Classe", filtered["Prob. stimata"].map(label))
+    filtered.insert(0, "Classe", filtered["Prob. stimata"].map(cls))
     st.dataframe(filtered, use_container_width=True, hide_index=True)
 else:
     st.info("Nessun giocatore supera i filtri selezionati.")
 
-st.subheader("Scheda giocatore")
-players = sorted(fdf["player"].unique().tolist())
+st.subheader("📅 Prossime partite")
+future = get_next(cfg["id"], cfg["season"])
+future_rows = [{
+    "Data": pd.to_datetime(f["fixture"]["date"]).strftime("%d/%m/%Y %H:%M"),
+    "Partita": f"{f['teams']['home']['name']} - {f['teams']['away']['name']}"
+} for f in future]
+if future_rows:
+    st.dataframe(pd.DataFrame(future_rows), use_container_width=True, hide_index=True)
+
+st.subheader("👤 Scheda giocatore")
+players = sorted(df["player"].dropna().unique())
 if players:
     player = st.selectbox("Giocatore", players)
-    g = fdf[fdf["player"] == player].sort_values("date", ascending=False).copy()
-    st.dataframe(
-        g[["date","league","match","team","opponent","minutes","shots_total",
-           "shots_on_target","yellow_cards","red_cards","saves"]],
-        use_container_width=True, hide_index=True
-    )
+    g = df[df["player"] == player].sort_values("date", ascending=False)
+    st.dataframe(g[[
+        "date","match","team","opponent","minutes",
+        "shots_total","shots_on_target","yellow_cards","red_cards","saves"
+    ]], use_container_width=True, hide_index=True)
 
 st.divider()
-st.caption(
-    "Nota: la probabilità è una stima statistica, non una garanzia. "
-    "La prima versione usa frequenze pesate e una correzione per campioni piccoli. "
-    "Per uso reale va validata su dati storici fuori campione e confrontata con quote specifiche per mercato."
-)
+st.caption("Le percentuali sono stime statistiche, non garanzie. Prima dell'uso con quote reali il modello va validato su un campione storico più ampio.")
