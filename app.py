@@ -54,11 +54,11 @@ def get_fixtures(league_id, season, last_n):
     data = api_get("fixtures", {
         "league": league_id,
         "season": season,
-        "last": last_n,
         "status": "FT",
         "timezone": "Europe/Rome",
     })
-    return data.get("response", []), data.get("errors", [])
+    fixtures = data.get("response", [])
+    return fixtures[-last_n:], data.get("errors", [])
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def get_next(league_id, season):
